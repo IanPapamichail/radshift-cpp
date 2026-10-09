@@ -1,56 +1,328 @@
 # RadShift
 
-A C++20 Poisson CUSUM detector for identifying persistent increases in
-count-rate measurements.
+### Radiation Count-Rate Change Detection in Modern C++20
 
-RadShift reads a compact binary trace through a read-only memory mapping
-and processes observations sequentially. Its architecture separates file
-ownership, binary-format validation, and statistical detection.
+![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C?logo=cplusplus&logoColor=white)
+![Build](https://img.shields.io/badge/build-CMake-064F8C?logo=cmake&logoColor=white)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux-lightgrey)
+![Method](https://img.shields.io/badge/detection-Poisson%20CUSUM-purple)
+![Input](https://img.shields.io/badge/input-memory--mapped-orange)
+
+RadShift is a C++20 command-line tool for detecting increases in radiation count rates using a Poisson cumulative sum detector (CUSUM).
+
+It reads binary files containing event counts collected over fixed-duration intervals, validates their structure, and identifies the first interval where the accumulated evidence reaches a configured threshold.
+
+The included demonstration uses synthetic counts. No radiation detector, special hardware, or external service is required.
 
 ## Motivation
 
-Count-based sensors produce noisy integer observations. A single high count
-may be a random fluctuation rather than a persistent change.
+Radiation detectors record discrete events. Even when the background rate remains constant, the number of events observed during each measurement interval fluctuates.
 
-RadShift accumulates statistical evidence across observations to detect an
-increase from a specified baseline rate to a specified alternative rate.
+A single unusually high count does not necessarily indicate a change. RadShift accumulates statistical evidence across successive intervals to detect an increase above a known background rate.
 
-The project combines sequential statistics with explicit resource ownership
-and validated binary input.
+The project combines a practical scientific-computing problem with explicit resource ownership, defensive binary parsing, and a small, testable statistical core.
 
-## Current capabilities
+## Features
 
-- Read-only POSIX memory mapping.
-- RAII management of file descriptors and mappings.
-- Shared-lifetime memory views.
-- Validation of the RADCOUNT binary format.
-- Little-endian integer decoding.
-- Poisson CUSUM processing without per-bin allocation.
-- First-alarm reporting with zero-based bin indices.
-- Command-line configuration of rates and threshold.
-- Automated storage and detector tests through CTest.
-
-This version supports macOS/Linux APIs and completed input files that remain
-unchanged during processing.
+- Poisson CUSUM detection for increases above a known background rate.
+- Configurable background rate, alternative rate, and alarm threshold.
+- Read-only memory-mapped input using POSIX `mmap`.
+- Shared ownership that keeps mapped data alive while views use it.
+- Binary-format validation before accessing count records.
+- Explicit little-endian decoding.
+- Bounds-checked count access.
+- First-alarm reporting with zero-based interval indexing.
+- Automated tests for storage, parsing, and detection.
+- CMake build with CTest integration.
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    A["RADCOUNT file"] --> B["MappedFile"]
-    B --> C["MemoryView"]
-    C --> D["CountView"]
-    D --> E["PoissonCusum"]
-    F["DetectionConfig"] --> E
-    E --> G["Detection summary"]
-```
+The design separates file ownership, data interpretation, configuration, and statistical detection.
 
 | Component | Responsibility |
 |---|---|
-| `MappingResource` | Owns the mapping and releases it through RAII |
-| `MappedFile` | Opens and maps a regular file |
-| `MemoryView` | Keeps shared ownership of the mapping |
-| `CountView` | Validates the file and decodes counts |
+| `detail::MappingResource` | Owns the mapping and releases it through RAII. |
+| `MappedFile` | Opens and maps a regular file for read-only access. |
+| `MemoryView` | Retains shared ownership and exposes controlled byte access. |
+| `CountView` | Validates the binary format and provides decoded counts. |
+| `DetectionConfig` | Validates the rates and detection threshold. |
+| `PoissonCusum` | Updates the detection score and records the first alarm. |
+| CLI | Connects file input, configuration, processing, and reporting. |
+
+`MappedFile`, `MemoryView`, and `CountView` retain shared ownership of the underlying mapping. A `CountView` therefore remains usable after the original `MappedFile` object is destroyed.
+
+`PoissonCusum` receives one count at a time and has no dependency on files or memory mapping. This separation allows a future live-data adapter to reuse the detector.
+
+### Ownership and safety
+
+- File descriptors are closed through RAII.
+- Mappings are released when their final owner is destroyed.
+- Invalid headers and inconsistent payload sizes are rejected.
+- Declared record counts are validated without overflowing an untrusted size multiplication.
+- Counts are decoded without assuming pointer alignment.
+- Invalid numerical configuration is rejected.
+- Non-finite detector updates are rejected.
+
+Mapped input files must remain unchanged during processing. Shared ownership protects the mapping's lifetime; it does not protect against another process modifying or truncating the file.
+
+## Detection Method
+
+For each interval, RadShift compares two Poisson models:
+
+- **Background model:** rate `λ₀`.
+- **Alternative model:** higher rate `λ₁`, with `λ₁ > λ₀`.
+
+Let:
+
+- `xₜ` be the observed count in interval `t`.
+- `Δt` be the interval duration in seconds.
+- `h` be the positive alarm threshold.
+
+The log-likelihood increment is:
+
+```text
+Lₜ = xₜ · log(λ₁ / λ₀) − (λ₁ − λ₀) · Δt
+```
+
+The accumulated score is:
+
+```text
+Sₜ = max(0, Sₜ₋₁ + Lₜ)
+```
+
+An alarm is recorded when:
+
+```text
+Sₜ ≥ h
+```
+
+Evidence favoring the higher rate increases the score. Evidence favoring the background reduces it, with a lower bound of zero.
+
+The detector records the first alarm and continues processing the remaining intervals. The reported final score is the score after the complete file has been processed.
+
+## Requirements
+
+- macOS or Linux.
+- A compiler supporting C++20.
+- CMake 3.20 or newer.
+- Python 3 to generate the demonstration fixture.
+
+The C++ implementation uses the standard library and POSIX APIs. It requires no third-party C++ libraries.
+
+## Build
+
+From the repository root:
+
+```bash
+cmake -S . -B build-cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON
+
+cmake --build build-cmake --parallel
+```
+
+## Run Tests
+
+```bash
+ctest --test-dir build-cmake --output-on-failure
+```
+
+The test suite covers:
+
+- Known CUSUM scores and alarm timing.
+- Zero-count sequences.
+- An alarm in the first interval.
+- Retention of the first alarm during subsequent updates.
+- Invalid detection parameters.
+- Valid binary files and count access.
+- Mapping lifetime after the original file owner is destroyed.
+- Little-endian decoding.
+- Out-of-range count access.
+- Truncated headers and payloads.
+- Invalid magic, version, and header size.
+- Zero interval duration.
+- Invalid or inconsistent declared record counts.
+
+## Reproducible Demo
+
+Generate the fixture:
+
+```bash
+python3 scripts/create_fixture.py
+```
+
+This creates:
+
+```text
+examples/four_bins.rct
+```
+
+The fixture contains four one-second intervals:
+
+```text
+Counts: [0, 1, 2, 6]
+```
+
+Run the detector:
+
+```bash
+./build-cmake/radshift examples/four_bins.rct 1 3 4
+```
+
+Arguments:
+
+```text
+radshift <trace.rct> <baseline_rate> <alternative_rate> <threshold>
+```
+
+For this example:
+
+| Parameter | Value |
+|---|---:|
+| Background rate | 1 count/second |
+| Alternative rate | 3 counts/second |
+| Alarm threshold | 4 |
+| Interval duration | 1 second |
+
+Expected numerical results:
+
+| Interval index | Count | Score after update |
+|---:|---:|---:|
+| 0 | 0 | 0.000000 |
+| 1 | 1 | 0.000000 |
+| 2 | 2 | 0.197225 |
+| 3 | 6 | 4.788898 |
+
+The first alarm occurs at interval index `3`, corresponding to the fourth measurement interval.
+
+Increase the threshold:
+
+```bash
+./build-cmake/radshift examples/four_bins.rct 1 3 10
+```
+
+The final score remains approximately `4.788898`, but no alarm is recorded because the score never reaches `10`.
+
+### Input validation example
+
+```bash
+./build-cmake/radshift examples/four_bins.rct 1 3abc 4
+```
+
+The CLI rejects the partially parsed numerical argument and returns a nonzero exit code.
+
+### Exit codes
+
+| Code | Meaning |
+|---:|---|
+| `0` | Processing completed successfully, with or without an alarm. |
+| `1` | Input, configuration, or processing error. |
+| `2` | Incorrect number of command-line arguments. |
+
+## Binary Format: RADCOUNT v1
+
+All integer fields use little-endian encoding.
+
+| Byte offset | Size | Type | Meaning |
+|---:|---:|---|---|
+| 0 | 8 bytes | ASCII | Magic value: `RADCOUNT` |
+| 8 | 4 bytes | `uint32` | Format version: `1` |
+| 12 | 4 bytes | `uint32` | Header size: `32` |
+| 16 | 8 bytes | `uint64` | Number of count intervals |
+| 24 | 8 bytes | `uint64` | Interval duration in nanoseconds |
+| 32 | `4 × N` bytes | `uint32[N]` | Counts for successive intervals |
+
+A valid file must contain:
+
+- A complete 32-byte header.
+- The expected magic, version, and header size.
+- A positive number of intervals.
+- A positive interval duration.
+- Exactly one four-byte count per declared interval.
+
+Individual counts may be zero.
+
+The demonstration file occupies 48 bytes: a 32-byte header and four four-byte counts.
+
+## Repository Layout
+
+```text
+include/radshift/
+    mapping_resource.hpp
+    mapped_file.hpp
+    memory_view.hpp
+    count_view.hpp
+    detection_config.hpp
+    poisson_cusum.hpp
+
+src/
+    mapping_resource.cpp
+    mapped_file.cpp
+    count_view.cpp
+    detection_config.cpp
+    poisson_cusum.cpp
+    main.cpp
+
+tests/
+    test_storage.cpp
+    test_poisson_cusum.cpp
+
+scripts/
+    create_fixture.py
+
+examples/
+    four_bins.rct
+
+CMakeLists.txt
+README.md
+.gitignore
+```
+
+## Performance Design
+
+RadShift maps the input file instead of first copying its complete payload into an application-owned buffer.
+
+Count records are decoded on demand, and the detector keeps constant-size state. The processing loop does not allocate memory or print output for individual intervals.
+
+For `N` intervals:
+
+- Detection takes `O(N)` time.
+- Detector state occupies `O(1)` space.
+- The virtual mapping spans the input file; resident memory depends on operating-system paging and file access.
+
+Memory mapping does not eliminate disk I/O or page faults. Its performance relative to buffered reading depends on the workload and operating system.
+
+No throughput or speedup claims are made yet. A reproducible comparison with buffered input is planned.
+
+## Scope and Assumptions
+
+The current implementation assumes:
+
+- Counts are modeled as independent Poisson observations.
+- Measurement intervals have a fixed duration.
+- The background and alternative rates are supplied by the user.
+- The change of interest is an increase in count rate.
+- Input files are complete and remain unchanged during processing.
+
+The threshold is user-configured. It has not been calibrated to a specific false-alarm probability or average run length.
+
+The demonstration is a deterministic synthetic fixture. It verifies the implementation's behavior but does not establish detection performance on real measurements.
+
+The current version does not estimate radiation dose, identify isotopes, or model detector dead time. It is a software demonstration, not a certified radiation monitoring instrument.
+
+## Roadmap
+
+- Seeded Poisson trace generation with configurable change points.
+- Monte Carlo evaluation of false alarms and detection delay.
+- Threshold calibration under explicitly documented assumptions.
+- Buffered-input comparison and reproducible benchmarks.
+- CSV export of scores and alarm results.
+- Automated CLI integration tests.
+- Live measurement input through a separate adapter.
+
+## Author
+
+Nickolas Adrian Papamichail| `CountView` | Validates the file and decodes counts |
 | `DetectionConfig` | Validates rates and alarm threshold |
 | `PoissonCusum` | Processes counts and records the first alarm |
 
